@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dankestrick.omajournal",
+  "name": "OmaJournal",
+  "version": "0.1.0",
+  "author": "Dankestrick",
+  "license": "MIT",
+  "description": "Omarchy's bar clock with your Obsidian daily notes: the same dots Obsidian's calendar shows, and each day's to-dos and journal one click away.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaJournal",
+    "description": "Clock and calendar with your Obsidian daily notes",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "schema": [
+      {
+        "key": "vaultPath",
+        "type": "path",
+        "label": "Obsidian vault",
+        "description": "Leave empty to use the vault Obsidian has open.",
+        "defaultValue": ""
+      }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clock"
+  }
+}

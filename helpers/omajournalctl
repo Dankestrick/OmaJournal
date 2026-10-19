@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Read and edit Obsidian daily notes for the OmaJournal calendar.
+
+Commands (each prints one JSON object):
+  month YYYY-MM          word counts and to-do counts for every note in a month
+  day YYYY-MM-DD         one day's note: to-dos, journal lines, a content hash
+  toggle DATE LINE HASH  tick or untick the to-do on LINE (1-based)
+  add DATE HASH          add a to-do; its text is one line on stdin
+  note DATE HASH         add a line to the journal (or Notes); text on stdin
+  create DATE            make the note from the Daily notes template
+
+The vault comes from --vault or Obsidian's open vault. Folder, file name
+format and template come from the vault's Daily notes settings. Reads are
+capped at 1 MiB per file, writes are atomic, and an edit only goes through
+when the note still matches the hash the panel last read.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import urllib.parse
+
+LIMIT = 1024 * 1024
+MAX_TODOS = 60
+MAX_JOURNAL = 12
+MAX_TEXT = 300
+MAX_OUTPUT = 64 * 1024
+# Same rule as Obsidian's Calendar plugin: one dot per 250 words, 1 to 5.
+WORDS_PER_DOT = 250
+MAX_DOTS = 5
+
+TODO = re.compile(r"^(\s*)[-*+] \[(.)\] ?(.*)$")
+OPEN_TASK = re.compile(r"(-|\*) \[ \]")
+WORD = re.compile(r"(?:[0-9]+(?:[.,][0-9]+)*|[-\w])+")
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+TODO_HEADINGS = ("to do", "todo", "to-do", "tasks")
+# Dates and flags the Obsidian Tasks plugin appends ("✅ 2026-10-19", "📅 …", "⏫").
+TASKS_FIELDS = re.compile(r"\s*(?:[✅❌📅⏳🛫➕]\ufe0f?\s*\d{4}-\d{2}-\d{2}|🔁\ufe0f?[^✅❌📅⏳🛫➕⏫🔼🔽🔺⏬]*|[⏫🔼🔽🔺⏬]\ufe0f?)")
+MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December"]
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+class Fail(Exception):
+    pass
+
+
+def read_bytes(path):
+    """Bounded read of a regular file; None when it does not exist."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise Fail("Not a regular file: " + os.path.basename(path))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Fail("Not a regular file: " + os.path.basename(path))
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(LIMIT + 1)
+    finally:
+        os.close(fd)
+    if len(data) > LIMIT:
+        raise Fail("Note is larger than 1 MiB")
+    return data
+
+
+def read_json(path):
+    try:
+        data = read_bytes(path)
+    except (OSError, Fail):
+        return None
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def find_vault(explicit):
+    if explicit:
+        path = os.path.realpath(os.path.expanduser(explicit))
+        if not os.path.isdir(os.path.join(path, ".obsidian")):
+            raise Fail("No Obsidian vault at " + explicit)
+        return path
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    known = read_json(os.path.join(config, "obsidian", "obsidian.json")) or {}
+    vaults = [v for v in (known.get("vaults") or {}).values() if isinstance(v, dict) and v.get("path")]
+    # The vault Obsidian has open, else the one used last.
+    vaults.sort(key=lambda v: (bool(v.get("open")), v.get("ts") or 0), reverse=True)
+    for vault in vaults:
+        path = os.path.realpath(vault["path"])
+        if os.path.isdir(os.path.join(path, ".obsidian")):
+            return path
+    raise Fail("Couldn't find your Obsidian vault. Set it in the widget settings.")
+
+
+def daily_settings(vault):
+    raw = read_json(os.path.join(vault, ".obsidian", "daily-notes.json")) or {}
+    folder = str(raw.get("folder") or "").strip().strip("/")
+    fmt = str(raw.get("format") or "").strip() or "YYYY-MM-DD"
+    template = str(raw.get("template") or "").strip()
+    return folder, fmt, template
+
+
+def format_date(fmt, day):
+    """The moment.js tokens Obsidian's daily note names use."""
+    tokens = {
+        "YYYY": "%04d" % day.year, "YY": "%02d" % (day.year % 100),
+        "MMMM": MONTHS[day.month - 1], "MMM": MONTHS[day.month - 1][:3],
+        "MM": "%02d" % day.month, "M": str(day.month),
+        "DDDD": "%03d" % day.timetuple().tm_yday, "DD": "%02d" % day.day,
+        "Do": str(day.day) + ordinal(day.day), "D": str(day.day),
+        "dddd": DAYS[day.weekday()], "ddd": DAYS[day.weekday()][:3],
+        "dd": DAYS[day.weekday()][:2], "d": str((day.weekday() + 1) % 7),
+        "E": str(day.weekday() + 1), "e": str((day.weekday() + 1) % 7),
+        "ww": "%02d" % day.isocalendar()[1], "w": str(day.isocalendar()[1]),
+        "WW": "%02d" % day.isocalendar()[1], "W": str(day.isocalendar()[1]),
+        "gggg": "%04d" % day.isocalendar()[0], "GGGG": "%04d" % day.isocalendar()[0],
+    }
+    pattern = re.compile(r"\[[^\]]*\]|" + "|".join(sorted(map(re.escape, tokens), key=len, reverse=True)))
+    return pattern.sub(lambda m: m.group(0)[1:-1] if m.group(0).startswith("[") else tokens[m.group(0)], fmt)
+
+
+def ordinal(n):
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def note_path(vault, folder, fmt, day):
+    rel = format_date(fmt, day) + ".md"
+    if folder:
+        rel = folder + "/" + rel
+    path = os.path.realpath(os.path.join(vault, rel))
+    if os.path.commonpath([vault, path]) != vault:
+        raise Fail("Daily note path leaves the vault")
+    return rel, path
+
+
+def parse_date(text):
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        raise Fail("Bad date: " + text[:20])
+
+
+def clean(text):
+    """Markdown down to what a reader sees, for a one-line preview."""
+    text = re.sub(r"\[\[([^\]|]*)\|([^\]]*)\]\]", r"\2", text)
+    text = re.sub(r"\[\[([^\]]*)\]\]", lambda m: m.group(1).rsplit("/", 1)[-1], text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"(\*\*|__|`|~~|==)", "", text)
+    text = text.strip()
+    return text[:MAX_TEXT - 1] + "…" if len(text) > MAX_TEXT else text
+
+
+def counts(text):
+    words = len(WORD.findall(text))
+    todos = [m for m in (TODO.match(line) for line in text.split("\n")) if m and m.group(3).strip()]
+    done = sum(1 for m in todos if m.group(2) not in (" ",))
+    return {
+        "words": words,
+        "dots": max(1, min(MAX_DOTS, words // WORDS_PER_DOT)),
+        "openTasks": len(OPEN_TASK.findall(text)) > 0,
+        "todos": len(todos),
+        "done": done,
+    }
+
+
+def describe(vault, rel, data):
+    text = data.decode("utf-8", errors="replace")
+    lines = text.split("\n")
+    todos, journal, section, level = [], [], "", 0
+    for number, line in enumerate(lines, 1):
+        heading = HEADING.match(line)
+        if heading:
+            section, level = heading.group(2).strip().lower(), len(heading.group(1))
+            continue
+        todo = TODO.match(line)
+        if todo:
+            if todo.group(3).strip() and len(todos) < MAX_TODOS:
+                todos.append({
+                    "line": number,
+                    "text": clean(TASKS_FIELDS.sub("", todo.group(3))),
+                    "done": todo.group(2) != " ",
+                    "indent": min(4, len(todo.group(1).expandtabs(2)) // 2),
+                })
+            continue
+        stripped = line.strip()
+        if (section in ("journal", "notes", "log")
+                and stripped and not stripped.startswith(("---", "|", "![["))):
+            preview = clean(re.sub(r"^\s*([-*+]|\d+[.)])\s+", "", line))
+            if preview:
+                journal.append(preview)
+                # Keep the newest lines; the panel shows the last few.
+                del journal[:-MAX_JOURNAL]
+    result = counts(text)
+    result.update({
+        "exists": True,
+        "file": rel,
+        "hash": hashlib.sha256(data).hexdigest(),
+        "todoList": todos,
+        "journal": journal,
+        "uri": obsidian_uri(vault, rel),
+    })
+    return result
+
+
+def obsidian_uri(vault, rel):
+    target = rel[:-3] if rel.endswith(".md") else rel
+    query = urllib.parse.urlencode({"vault": os.path.basename(vault), "file": target}, quote_via=urllib.parse.quote)
+    return "obsidian://open?" + query
+
+
+def write_atomic(path, data, expected):
+    """Replace the note only if it still holds the bytes the panel read."""
+    current = read_bytes(path)
+    if current is None or hashlib.sha256(current).hexdigest() != expected:
+        raise Fail("The note changed since the calendar read it. Try again.")
+    mode = stat.S_IMODE(os.lstat(path).st_mode)
+    fd, name = tempfile.mkstemp(prefix=".omajournal-", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def cmd_month(vault, folder, fmt, text):
+    try:
+        year, month = (int(part) for part in text.split("-"))
+        first = datetime.date(year, month, 1)
+    except ValueError:
+        raise Fail("Bad month: " + text[:20])
+    days = {}
+    day = first
+    while day.month == first.month:
+        _, path = note_path(vault, folder, fmt, day)
+        try:
+            data = read_bytes(path)
+        except (OSError, Fail):
+            data = None
+        if data is not None:
+            info = counts(data.decode("utf-8", errors="replace"))
+            days[day.isoformat()] = {k: info[k] for k in ("words", "dots", "openTasks", "todos", "done")}
+        day += datetime.timedelta(days=1)
+    return {"ok": True, "month": first.strftime("%Y-%m"), "days": days}
+
+
+def cmd_day(vault, folder, fmt, text):
+    day = parse_date(text)
+    rel, path = note_path(vault, folder, fmt, day)
+    data = read_bytes(path)
+    if data is None:
+        return {"ok": True, "date": day.isoformat(), "exists": False, "file": rel, "uri": obsidian_uri(vault, rel)}
+    result = describe(vault, rel, data)
+    result.update({"ok": True, "date": day.isoformat()})
+    return result
+
+
+def cmd_toggle(vault, folder, fmt, text, line, expected):
+    day = parse_date(text)
+    rel, path = note_path(vault, folder, fmt, day)
+    data = read_bytes(path)
+    if data is None:
+        raise Fail("That note is gone")
+    lines = data.decode("utf-8").split("\n")
+    if not 1 <= line <= len(lines):
+        raise Fail("That to-do moved. Try again.")
+    match = TODO.match(lines[line - 1])
+    if not match:
+        raise Fail("That to-do moved. Try again.")
+    mark = " " if match.group(2) != " " else "x"
+    start = lines[line - 1].index("[") + 1
+    lines[line - 1] = lines[line - 1][:start] + mark + lines[line - 1][start + 1:]
+    write_atomic(path, "\n".join(lines).encode("utf-8"), expected)
+    return cmd_day(vault, folder, fmt, text)
+
+
+def cmd_add(vault, folder, fmt, text, expected):
+    day = parse_date(text)
+    # One line, so the caller doesn't have to close stdin.
+    item = sys.stdin.readline(MAX_TEXT + 2).replace("\r", " ").replace("\n", " ").strip()
+    if not item:
+        raise Fail("Type a to-do first")
+    if len(item) > MAX_TEXT:
+        raise Fail("That to-do is too long")
+    rel, path = note_path(vault, folder, fmt, day)
+    data = read_bytes(path)
+    if data is None:
+        raise Fail("Make the note first")
+    lines = data.decode("utf-8").split("\n")
+    # To-dos live in a "To do" section near the top: after its last to-do,
+    # or into the template's empty "- [ ]". A note without one gets a new
+    # "To do" section above its first section, so to-dos always come first.
+    heading, section_end, first_section, blank = None, None, None, None
+    for index, line in enumerate(lines):
+        found = HEADING.match(line)
+        if found:
+            if heading is not None and section_end is None:
+                section_end = index
+            if found.group(2).strip().lower() in TODO_HEADINGS and heading is None:
+                heading = index
+            if len(found.group(1)) >= 2 and first_section is None:
+                first_section = index
+        todo = TODO.match(line)
+        if todo and not todo.group(3).strip() and blank is None:
+            blank = index
+    entry = "- [ ] " + item
+    if heading is not None:
+        end = section_end if section_end is not None else len(lines)
+        last = None
+        for index in range(heading + 1, end):
+            if TODO.match(lines[index]):
+                last = index
+        if blank is not None and heading < blank < end:
+            lines[blank] = entry
+        elif last is not None:
+            lines.insert(last + 1, entry)
+        else:
+            lines[heading + 1:heading + 1] = ["", entry]
+    elif blank is not None:
+        lines[blank] = entry
+    elif first_section is not None:
+        lines[first_section:first_section] = ["## To do", "", entry, ""]
+    else:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", "## To do", "", entry, ""]
+    write_atomic(path, "\n".join(lines).encode("utf-8"), expected)
+    return cmd_day(vault, folder, fmt, text)
+
+
+def cmd_note(vault, folder, fmt, text, expected):
+    day = parse_date(text)
+    item = sys.stdin.readline(MAX_TEXT + 2).replace("\r", " ").replace("\n", " ").strip()
+    if not item:
+        raise Fail("Type a note first")
+    if len(item) > MAX_TEXT:
+        raise Fail("That note is too long")
+    rel, path = note_path(vault, folder, fmt, day)
+    data = read_bytes(path)
+    if data is None:
+        raise Fail("Make the note first")
+    lines = data.decode("utf-8").split("\n")
+    # Under "Journal", else "Notes", else a new "Journal" above "Next" (or at
+    # the end); after the section's last line, before the next heading.
+    found = {}
+    for index, line in enumerate(lines):
+        heading = HEADING.match(line)
+        if heading:
+            name = heading.group(2).strip().lower()
+            if name in ("journal", "notes", "next") and name not in found:
+                found[name] = index
+    start = found.get("journal", found.get("notes"))
+    entry = "- " + item
+    if start is None and "next" in found:
+        lines[found["next"]:found["next"]] = ["## Journal", "", entry, ""]
+    elif start is None:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", "## Journal", "", entry, ""]
+    else:
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            if HEADING.match(lines[index]):
+                end = index
+                break
+        last = start
+        for index in range(start + 1, end):
+            if lines[index].strip():
+                last = index
+        if last == start:
+            lines[start + 1:start + 1] = ["", entry]
+        else:
+            lines.insert(last + 1, entry)
+    write_atomic(path, "\n".join(lines).encode("utf-8"), expected)
+    return cmd_day(vault, folder, fmt, text)
+
+
+def fill_template(body, day, title):
+    now = datetime.datetime.now()
+    def date_token(match):
+        return format_date(match.group(1) or "YYYY-MM-DD", day)
+    def time_token(match):
+        fmt = match.group(1) or "HH:mm"
+        return fmt.replace("HH", "%02d" % now.hour).replace("mm", "%02d" % now.minute)
+    body = re.sub(r"\{\{date(?::([^}]*))?\}\}", date_token, body)
+    body = re.sub(r"\{\{time(?::([^}]*))?\}\}", time_token, body)
+    return body.replace("{{title}}", title)
+
+
+def cmd_create(vault, folder, fmt, template, text):
+    day = parse_date(text)
+    rel, path = note_path(vault, folder, fmt, day)
+    body = ""
+    if template:
+        tpl = template if template.endswith(".md") else template + ".md"
+        tpl_path = os.path.realpath(os.path.join(vault, tpl))
+        if os.path.commonpath([vault, tpl_path]) == vault:
+            try:
+                raw = read_bytes(tpl_path)
+            except (OSError, Fail):
+                raw = None
+            if raw is not None:
+                body = fill_template(raw.decode("utf-8", errors="replace"), day, os.path.basename(rel)[:-3])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        return cmd_day(vault, folder, fmt, text)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(body)
+    return cmd_day(vault, folder, fmt, text)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--vault", default="")
+    parser.add_argument("command", choices=["month", "day", "toggle", "add", "note", "create"])
+    parser.add_argument("args", nargs="*")
+    options = parser.parse_args()
+    try:
+        vault = find_vault(options.vault)
+        folder, fmt, template = daily_settings(vault)
+        args = options.args
+        if options.command == "month" and len(args) == 1:
+            result = cmd_month(vault, folder, fmt, args[0])
+        elif options.command == "day" and len(args) == 1:
+            result = cmd_day(vault, folder, fmt, args[0])
+        elif options.command == "toggle" and len(args) == 3:
+            result = cmd_toggle(vault, folder, fmt, args[0], int(args[1]), args[2])
+        elif options.command == "add" and len(args) == 2:
+            result = cmd_add(vault, folder, fmt, args[0], args[1])
+        elif options.command == "note" and len(args) == 2:
+            result = cmd_note(vault, folder, fmt, args[0], args[1])
+        elif options.command == "create" and len(args) == 1:
+            result = cmd_create(vault, folder, fmt, template, args[0])
+        else:
+            raise Fail("Wrong arguments")
+    except (Fail, OSError, ValueError, UnicodeDecodeError) as error:
+        result = {"ok": False, "error": str(error)[:200]}
+    out = json.dumps(result, ensure_ascii=True)
+    # The panel keeps what it reads in memory: never print more than 64 KiB.
+    if len(out) > MAX_OUTPUT:
+        result = {"ok": False, "error": "That note has too much to show"}
+        out = json.dumps(result)
+    print(out)
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
